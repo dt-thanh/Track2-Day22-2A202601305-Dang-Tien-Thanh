@@ -16,8 +16,15 @@ DELIVERABLE: faithfulness ≥ 0.8 cho ít nhất 1 prompt version
 """
 import sys
 import json
+import os
 import warnings
 warnings.filterwarnings("ignore")
+
+# RAGAS analytics adds one external HTTP request per evaluator task. Disable it
+# for a deterministic lab run, and keep the already-complete Step 1/2 tracing
+# project free from hundreds of evaluator-only traces.
+os.environ["RAGAS_DO_NOT_TRACK"] = "true"
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
 from pathlib import Path
 
@@ -61,6 +68,7 @@ PROMPT_V2 = ChatPromptTemplate.from_messages([
 ])
 
 PROMPTS = {"v1": PROMPT_V1, "v2": PROMPT_V2}
+DATA_DIR = Path(__file__).parent.parent / "data"
 
 
 # ── 2. Setup Vectorstore ───────────────────────────────────────────────────
@@ -119,6 +127,24 @@ def collect_rag_outputs(vectorstore, prompt_version: str) -> list:
         })
         print(f"  [{i:02d}/50] {qa['question'][:60]}")
 
+    return results
+
+
+def load_or_collect_rag_outputs(vectorstore, prompt_version: str) -> list:
+    """Reuse a complete checkpoint, or collect and persist all 50 outputs."""
+    cache_path = DATA_DIR / f"ragas_outputs_{prompt_version}.json"
+    if cache_path.exists():
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if len(cached) == len(QA_PAIRS):
+            print(f"♻️  Dùng checkpoint {cache_path.name} ({len(cached)} mẫu)")
+            return cached
+
+    results = collect_rag_outputs(vectorstore, prompt_version)
+    cache_path.write_text(
+        json.dumps(results, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"💾 Đã lưu checkpoint {cache_path.name}")
     return results
 
 
@@ -190,6 +216,30 @@ def run_ragas_eval(rag_results: list, version: str) -> dict:
     return scores
 
 
+def load_or_run_ragas_eval(rag_results: list, version: str) -> dict:
+    """Reuse completed metric scores so an interrupted V2 run can resume."""
+    score_path = DATA_DIR / f"ragas_scores_{version}.json"
+    expected = {
+        "faithfulness",
+        "answer_relevancy",
+        "context_recall",
+        "context_precision",
+    }
+    if score_path.exists():
+        scores = json.loads(score_path.read_text(encoding="utf-8"))
+        if expected.issubset(scores):
+            print(f"♻️  Dùng checkpoint điểm {score_path.name}")
+            return scores
+
+    scores = run_ragas_eval(rag_results, version)
+    score_path.write_text(
+        json.dumps(scores, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"💾 Đã lưu checkpoint điểm {score_path.name}")
+    return scores
+
+
 # ── 6. Main ────────────────────────────────────────────────────────────────
 def main():
     print("=" * 60)
@@ -202,12 +252,12 @@ def main():
     vectorstore = setup_vectorstore()
 
     # Thu thập kết quả RAG cho cả V1 và V2
-    v1_results = collect_rag_outputs(vectorstore, "v1")
-    v2_results = collect_rag_outputs(vectorstore, "v2")
+    v1_results = load_or_collect_rag_outputs(vectorstore, "v1")
+    v2_results = load_or_collect_rag_outputs(vectorstore, "v2")
 
     # Chạy RAGAS evaluation
-    v1_scores = run_ragas_eval(v1_results, "v1")
-    v2_scores = run_ragas_eval(v2_results, "v2")
+    v1_scores = load_or_run_ragas_eval(v1_results, "v1")
+    v2_scores = load_or_run_ragas_eval(v2_results, "v2")
 
     # In bảng so sánh
     print("\n" + "=" * 65)
@@ -231,7 +281,7 @@ def main():
         "prompt_v2_scores": v2_scores,
         "target_met": best_faith >= 0.8,
     }
-    report_path = Path(__file__).parent.parent / "data" / "ragas_report.json"
+    report_path = DATA_DIR / "ragas_report.json"
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
